@@ -75,7 +75,8 @@ void Server::init() {
 	if ((this->serverSocket = socket(PF_INET, SOCK_STREAM, 0)) == -1)
 		throw std::runtime_error("Error : server socket is wrong");
 
-	// 서버의 주소 값을 초기화, socket_internet의 family, address, port를 지정
+	// 서버의 주소 구조체 초기화:
+	// AF_INET으로 주소 체계를 지정, INADDR_ANY를 사용해 모든 인터페이스의 들어오는 연결 허용, 서버 포트는 this->port 값으로 설정
 	memset(&this->servAddr, 0, sizeof(this->servAddr));
 	this->servAddr.sin_family = AF_INET;
 	this->servAddr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -84,6 +85,7 @@ void Server::init() {
 	/*
 	요약:
 	서버의 메인 소켓(this->servSock)에 대한 읽기 이벤트(EVFILT_READ)를 this->eventListToRegister 벡터에 추가한다.
+	eventListToRegister는 kqueue 이벤트 목록을 관리하는 벡터: (cf. typedef std::vector<struct kevent> kquvec;)
 	(내부적으로 EV_SET 매크로를 사용해 kevent 구조체를 초기화하고, 이를 this->eventListToRegister 벡터에 추가)
 	이 함수 호출은 kqueue 이벤트 모니터링 시스템을 설정하는 데 사용된다.
 
@@ -111,7 +113,7 @@ void Server::init() {
 	setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &isReuseAddr, sizeof(int));
 
 	// bind() 함수는 소켓에 주소를 할당하는 함수
-	// 서버 소켓에 주소를 할당한다.
+	// 서버 소켓에 서버 주소를 할당한다.
 	if (bind(serverSocket, (struct sockaddr*)&servAddr, sizeof(servAddr)) == SYS_FAILURE)
 		throw std::runtime_error("Error : bind");
 
@@ -123,6 +125,11 @@ void Server::init() {
 	// fcntl() 함수는 파일 디스크립터의 플래그를 변경하는 함수
 	// 서브젝트 자체에서 해당 소켓을 논블로킹으로 설정하도록 얘기했음(MacOS의 경우).
 	fcntl(serverSocket, F_SETFL, O_NONBLOCK);
+	/*
+	논블로킹 모드로 설정된 소켓은 연결 수락, 데이터 읽기 및 쓰기 등의 작업을 수행할 때 해당 작업이 완료될 때까지 대기하지 않고 즉시 반환된다.
+	이는 네트워크 프로그래밍에서 매우 유용하며, 특히 이벤트 기반 또는 비동기 프로그래밍에 필수적이다.
+	논블로킹 소켓을 사용하면 서버가 여러 클라이언트를 동시에 효율적으로 처리할 수 있으며, 서버의 반응성이 향상된다.
+	*/
 
 	// 서버의 가동 상태를 의미하는 플래그
 	this->running = true;
@@ -178,33 +185,35 @@ void Server::loop() {
 		함수가 반환된 후, newEvents 배열은 발생한 이벤트들의 정보를 담고 있으며, 이를 통해 서버는 적절한 반응을 할 수 있다.
 		이러한 방식으로 kevent 함수는 kqueue를 통해 다수의 이벤트를 효율적으로 관리하고, 서버는 이를 이용해 여러 클라이언트와의 통신을 동시에 처리할 수 있다.
 		*/
-		this->eventListToRegister.clear();
+		this->eventListToRegister.clear(); // kqueue에 이벤트가 등록되었으므로, 이벤트 목록을 비운다.
 
 		for (int i = 0; i < cntNewEvents; i++) {
-			struct kevent cur = newEvents[i];
-			if (cur.flags & EV_ERROR) {
-				if (isServerEvent(cur.ident)) {
-					running = false;
-					break ;
+			struct kevent cur = newEvents[i]; // 현재 이벤트를 newEvents 배열에서 가져옴
+
+			if (cur.flags & EV_ERROR) { // 이벤트에 오류 플래그가 설정되어 있는지 확인
+				if (isServerEvent(cur.ident)) { // 오류 이벤트가 서버 소켓과 관련된 것인지 확인
+					running = false; // 서버 이벤트인 경우 서버 자체의 오류이므로 서버 종료
+					break; // 루프 종료
 				}
 				else {
-					deleteClient(cur.ident);
+					deleteClient(cur.ident); // 오류 이벤트가 클라이언트와 관련된 것이면 해당 클라이언트 삭제
 				}
 			}
-			if (cur.flags & EVFILT_READ) {
-				if (isServerEvent(cur.ident)) {
-					addClient(cur.ident);
+			if (cur.flags & EVFILT_READ) { // 읽기 이벤트인지 확인
+				if (isServerEvent(cur.ident)) { // 읽기 이벤트가 서버 소켓과 관련된 것인지 확인
+					addClient(cur.ident); // 새 클라이언트 연결 요청 처리
 				}
-				if (this->containsCurrentEvent(cur.ident)) {
-					handleReadEvent(cur.ident, cur.data);
+				if (this->containsCurrentEvent(cur.ident)) { // 현재 이벤트가 처리 목록에 있는지 확인
+					handleReadEvent(cur.ident, cur.data); // 클라이언트로부터의 데이터 읽기 처리
 				}
 			}
-			if (cur.ident & EVFILT_WRITE) {
-				if (this->containsCurrentEvent(cur.ident))
-					handleWriteEvent(cur.ident);
+			if (cur.ident & EVFILT_WRITE) { // 쓰기 이벤트인지 확인
+				if (this->containsCurrentEvent(cur.ident)) { // 현재 이벤트가 처리 목록에 있는지 확인
+					handleWriteEvent(cur.ident); // 클라이언트에 데이터 쓰기 처리
+				}
 			}
 		}
-		// 새 이벤트에 대한 처리가 끝난 이후에 다음 루프를 돌기 전에, 클라이언트와의 연결 상태를 확인한다.
+		// 모든 새 이벤트에 대한 처리가 끝난 후, 연결이 끊긴 클라이언트를 처리
 		handleDisconnectedClients();
 	}
 }
@@ -235,7 +244,7 @@ data: 필터에 의해 사용될 추가 데이터.
 udata: 사용자 정의 데이터, 필터에 의해 사용될 수 있습니다.
 
 2) 이벤트 목록에 추가:
-초기화된 struct kevent 객체 tmp를 list (이벤트 목록을 나타내는 kquvec 벡터)에 추가합니다.
+초기화된 struct kevent 객체를 list (이벤트 목록을 나타내는 (struct kevent를 담는) kquvec 벡터)에 추가합니다.
 이렇게 하면 해당 이벤트가 kqueue 시스템에 의해 추후 모니터링될 수 있도록 준비됩니다.
 */
 void Server::pushEventToList(kquvec& list, uintptr_t ident, int16_t filter, uint16_t flags, uint32_t fflags, intptr_t data, void* udata) {
@@ -243,7 +252,7 @@ void Server::pushEventToList(kquvec& list, uintptr_t ident, int16_t filter, uint
 
 	// ident: eventListRegister, filter: EVFILT_READ, flags: EV_ADD | EV_ENABLE, fflags: 0, data: 0, udata: NULL
 	EV_SET(&toPut, ident, filter, flags, fflags, data, udata);
-	list.push_back(toPut);
+	list.push_back(toPut); //list(eventListRegister)는 struct kevent를 담는 벡터
 }
 
 void Server::addClient(int fd) {
