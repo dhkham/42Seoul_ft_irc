@@ -256,31 +256,51 @@ void Server::pushEventToList(kquvec& list, uintptr_t ident, int16_t filter, uint
 }
 
 void Server::addClient(int fd) {
-	int clientSocket;
-	struct sockaddr_in clntAdr;
-	socklen_t clntSz;
+    int clientSocket; // 새 클라이언트의 소켓
+    struct sockaddr_in clntAdr; // 클라이언트 주소 정보를 저장할 구조체
+    socklen_t clntSz; // 클라이언트 주소 정보의 크기
 
-	clntSz = sizeof(clntAdr);
-	if ((clientSocket = accept(fd, (struct sockaddr*)&clntAdr, &clntSz)) == -1)
-		throw std::runtime_error("Error : accept!()");
-	pushEventToList(this->eventListToRegister, clientSocket, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
-	pushEventToList(this->eventListToRegister, clientSocket, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
-	this->clientList.insert(std::make_pair(clientSocket, new Client(clientSocket, clntAdr.sin_addr)));
-	Buffer::resetReadBuf(clientSocket);
-	Buffer::resetSendBuf(clientSocket);
-	fcntl(clientSocket, F_SETFL, O_NONBLOCK);
+    clntSz = sizeof(clntAdr); // 클라이언트 주소 구조체의 크기를 설정
+    // 새 클라이언트 연결 수락
+    if ((clientSocket = accept(fd, (struct sockaddr*)&clntAdr, &clntSz)) == -1)
+        throw std::runtime_error("Error : accept!()"); // 연결 수락 실패 시 예외 발생
 
-	Print::PrintComplexLineWithColor("[" + getStringTime(time(NULL)) + "] " + "Connected Client : ", clientSocket, GREEN);
+    // 클라이언트 소켓에 대한 읽기 이벤트를 이벤트 리스트에 추가
+    pushEventToList(this->eventListToRegister, clientSocket, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    // 클라이언트 소켓에 대한 쓰기 이벤트를 이벤트 리스트에 추가
+    pushEventToList(this->eventListToRegister, clientSocket, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    
+    // 클라이언트 목록에 새 클라이언트 추가
+    this->clientList.insert(std::make_pair(clientSocket, new Client(clientSocket, clntAdr.sin_addr)));
+    
+    // 클라이언트 소켓의 읽기 및 쓰기 버퍼 초기화
+    Buffer::resetReadBuf(clientSocket);
+    Buffer::resetSendBuf(clientSocket);
+
+    // 클라이언트 소켓을 논블로킹 모드로 설정
+    fcntl(clientSocket, F_SETFL, O_NONBLOCK);
+
+    // 새로 연결된 클라이언트에 대한 정보 출력
+    Print::PrintComplexLineWithColor("[" + getStringTime(time(NULL)) + "] " + "Connected Client : ", clientSocket, GREEN);
 }
 
 void Server::deleteClient(int fd) {
-	if (this->op == this->clientList[fd])
-		this->op = NULL;
-	delete this->clientList[fd];
-	Buffer::eraseReadBuf(fd);
-	Buffer::eraseSendBuf(fd);
-	this->clientList.erase(fd);
-	Print::PrintComplexLineWithColor("[" + getStringTime(time(NULL)) + "] " + "Disconnected Client : ", fd, RED);
+    // 만약 현재 작업 중인 클라이언트가 삭제될 클라이언트와 같다면, 작업 중인 클라이언트 참조를 NULL로 설정
+    if (this->op == this->clientList[fd])
+        this->op = NULL;
+
+    // 클라이언트 객체 삭제
+    delete this->clientList[fd];
+
+    // 해당 클라이언트의 읽기 및 쓰기 버퍼를 버퍼 관리 객체에서 제거
+    Buffer::eraseReadBuf(fd);
+    Buffer::eraseSendBuf(fd);
+
+    // 클라이언트 목록에서 해당 클라이언트 제거
+    this->clientList.erase(fd);
+
+    // 연결 해제된 클라이언트에 대한 정보를 로그로 출력
+    Print::PrintComplexLineWithColor("[" + getStringTime(time(NULL)) + "] " + "Disconnected Client : ", fd, RED);
 }
 
 void Server::addChannel(std::string& chName, Client* client) {
@@ -297,63 +317,82 @@ void Server::delChannel(std::string& chName) {
 }
 
 void Server::handleDisconnectedClients() {
-	time_t curTime = time(NULL);
+    time_t curTime = time(NULL); // 현재 시간을 가져옴
 
-	for (cltmap::iterator it = this->clientList.begin(); it != clientList.end(); it++) {
-		if ((it->second->getPassConnect() & IS_LOGIN) && (curTime - it->second->getTime()) > 120)
-			deleteClient(it->first);
-	}
+    // 클라이언트 목록을 순회
+    for (cltmap::iterator it = this->clientList.begin(); it != clientList.end(); it++) {
+        // 클라이언트가 로그인 상태이며, 마지막 활동 시간으로부터 120초 이상 경과했는지 확인
+        if ((it->second->getPassConnect() & IS_LOGIN) && (curTime - it->second->getTime()) > 120) {
+            // 해당 조건을 만족하는 클라이언트를 삭제
+            deleteClient(it->first);
+        }
+    }
 }
 
 void Server::handleReadEvent(int fd, intptr_t data) {
-	std::string buffer;
-	std::string message;
-	int byte = 0;
-	size_t size = 0;
-	int suffixFlag = 0;
-	int cut;
+    // 변수 선언
+    std::string buffer;
+    std::string message;
+    int byte = 0;
+    size_t size = 0;
+    int suffixFlag = 0;
+    int cut;
 
-	this->clientList[fd]->setFinalTime();
-	byte = Buffer::readMessage(fd, data);
+    // 클라이언트의 마지막 활동 시간 업데이트
+    this->clientList[fd]->setFinalTime();
 
-	if (byte == -1)
-		return ;
-	if (byte == 0)
-		return deleteClient(fd);
+    // 클라이언트로부터 메시지 읽기 시도
+    byte = Buffer::readMessage(fd, data);
 
-	buffer = Buffer::getReadBuf(fd);
-	Buffer::resetReadBuf(fd);
-	while (true) {
-		if ((size = buffer.find(CRLF)) != std::string::npos) {
-			suffixFlag = 0;
-		} else if ((size = buffer.find(CR)) != std::string::npos) {
-			suffixFlag = 1;
-		} else if ((size = buffer.find(LF)) != std::string::npos) {
-			suffixFlag = 2;
-		} else {
-			break;
-		}
-		if (suffixFlag == 0)
-			cut = size + 2;
-		else
-			cut = size + 1;
+    // 읽기 오류 또는 클라이언트 연결 종료 처리
+    if (byte == -1)
+        return;
+    if (byte == 0)
+        return deleteClient(fd);
 
-		message = "";
-		message += buffer.substr(0, cut);
-		buffer = buffer.substr(cut, buffer.size());
-		if (message.size() > 512) {
-			Buffer::sendMessage(fd, error::ERR_INPUTTOOLONG(this->getHost()));
-			continue;
-		}
-		Message::parsMessage(message);
-		runCommand(fd);
-	}
-	Buffer::setReadBuf(std::make_pair(fd, buffer));
+    // 버퍼에서 읽은 데이터 가져오기
+    buffer = Buffer::getReadBuf(fd);
+    Buffer::resetReadBuf(fd);
+
+    // 메시지 처리 루프
+    while (true) {
+        // 메시지 종료 문자 찾기
+        if ((size = buffer.find(CRLF)) != std::string::npos) {
+            suffixFlag = 0;
+        } else if ((size = buffer.find(CR)) != std::string::npos) {
+            suffixFlag = 1;
+        } else if ((size = buffer.find(LF)) != std::string::npos) {
+            suffixFlag = 2;
+        } else {
+            break;
+        }
+
+        // 메시지 추출 및 처리
+        cut = (suffixFlag == 0) ? size + 2 : size + 1;
+        message = buffer.substr(0, cut);
+        buffer = buffer.substr(cut, buffer.size());
+
+        // 메시지 길이 확인
+        if (message.size() > 512) {
+            Buffer::sendMessage(fd, error::ERR_INPUTTOOLONG(this->getHost()));
+            continue;
+        }
+
+        // 메시지 파싱 및 커맨드 실행
+        Message::parsMessage(message);
+        runCommand(fd);
+    }
+
+    // 남은 버퍼 저장
+    Buffer::setReadBuf(std::make_pair(fd, buffer));
 }
 
 void Server::handleWriteEvent(int fd) {
-	this->clientList[fd]->setFinalTime();
-	Buffer::sendMessage(fd);
+    // 클라이언트의 마지막 활동 시간 업데이트
+    this->clientList[fd]->setFinalTime();
+
+    // 클라이언트에 메시지 전송
+    Buffer::sendMessage(fd);
 }
 
 void Server::runCommand(int fd) {
